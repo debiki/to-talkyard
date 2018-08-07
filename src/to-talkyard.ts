@@ -6,8 +6,6 @@
 //   nodejs dist/to-talkyard/src/to-talkyard.js  --wordpressCoreXmlExportFile file.xml
 
 
-
-
 import minimist from 'minimist';
 import _ from 'lodash';
 import fs from 'fs';
@@ -20,53 +18,25 @@ const parser = sax.parser(strict, {});
 const UnknownUserId = -2; // ??
 const DefaultCategoryId = 2;
 
-interface WpBlogPostAndComments {
-  title?: string;
-  link?: string;
-  pubDate?: string;
-  guid?: string;
-  description?: string;
-  contentEncoded?: string;
-  excerptEncoded?: string;
-  wp_post_id?: number;  // e.g. 3469
-  wp_post_date?: string; // e.g. 2016-01-09 21:53:01
-  wp_post_date_gmt?: string;    // e.g. 2016-01-10 03:53:01
-  wp_comment_status?: string;   // e.g. open
-  wp_ping_status?: string;      // e.g. open
-  wp_post_name?: string;        // e.g. public-talks-h2-2016
-  wp_status?: string;           // e.g. publish
-  wp_post_parent?: number;      // e.g. 0
-  wp_menu_order?: number;       // e.g. 0
-  wp_post_type?: string;        // e.g. post
-  wp_is_sticky?: number;        // e.g. 0
-  category?: string;            // e.g. Announcement
-  comments: WpComment[];
-}
 
-interface WpComment {
-  wp_comment_id?: number;       // e.g. 267390
-  wp_comment_author?: string;   // e.g. Jane
-  wp_comment_author_email?: string;  // e.g. jane@example.com
-  wp_comment_author_url?: string;
-  wp_comment_author_ip?: string;  // e.g. 112.113.114.115
-  wp_comment_date?: string;     // e.g. 2016-01-09 23:30:16
-  wp_comment_date_gmt?: string; // e.g. 2016-01-10 05:30:16
-  wp_comment_content?: string;  // Sarah, are you conducting any seminars this month? Please let me know.
-  wp_comment_approved?: number; // e.g. 1
-  wp_comment_type?: any;        // ?
-  wp_comment_parent?: number;   // e.g. 0 = replies to blog post, or 267390 = replies to wp_comment_id.
-  wp_comment_user_id?: number;  // e.g. 0  or 2
-  //metas: CommentMeta[];
-}
+const args: any = minimist(process.argv.slice(2));
 
-// Example meta:
-// akismet_history -> a:3:{s:4:"time";d:1453589774.1832039356231689453125;s:5:"event";s:15:"status-approved";s:4:"user";s:6:"tanelp";}
-// akismet_result -> false
-// (many items with same key = yes can happen)
-interface CommentMeta {
-  wp_meta_key?: string;
-  wp_meta_value?: string;
-}
+const wordpressXmlFilePath: string | undefined = args.wordpressCoreXmlExportFile;
+if (!_.isString(wordpressXmlFilePath))
+  throw Error("Missing: --wordpressCoreXmlExportFile=...");
+
+const writeToPath: string | undefined = args.writeTo;
+if (!_.isString(writeToPath))
+  throw Error("Missing: --writeTo=...");
+
+const fileText = fs.readFileSync(wordpressXmlFilePath, { encoding: 'utf8' });
+
+const verboseStr: string | undefined = args.verbose || args.v;
+const verbose: boolean = !!verboseStr && verboseStr !== 'f' && verboseStr !== 'false';
+
+console.log("The input file starts with: " + fileText.substring(0, 200));
+console.log("Processing ...");
+
 
 
 const wpPosts: WpBlogPostAndComments[] = [];
@@ -83,59 +53,180 @@ const tySiteData: SiteData = {
 };
 
 
-const builder = buildSite();
+const builder = buildSite(tySiteData);
 
 
 function addBlogPostAndComments(wpBlogPostAndComments: WpBlogPostAndComments) {
+  const linkNoOrigin = !wpBlogPostAndComments.link ? undefined :
+      wpBlogPostAndComments.link.replace(/https?:\/\/[^/]+\//, '');
+
   const pageToAdd: PageToAdd = {
     dbgSrc: 'ToTy',
-    id: 'extraPageId',
+    id: '?',
+    altIds: [wpBlogPostAndComments.link],
     folder: '/',
-    showId: false,
-    slug: 'extra-page',
+    showId: true,
+    slug: '',
     role: c.TestPageRole.Discussion,
-    title: "Download $100 000 and a new car",
-    body: "Type your email and password, and the you can download a new car",
+    title: "Comments for " + linkNoOrigin,
+    body: "Comments for " + wpBlogPostAndComments.link,
     categoryId: DefaultCategoryId,
-    authorId: UnknownUserId,
+    authorId: c.SystemUserId,
   };
 
   const pageJustAdded: PageJustAdded = builder.addPage(pageToAdd);
+  let nextReplyNr = c.FirstReplyNr;
 
-  const postToAdd: NewTestPost = {
-    page: pageJustAdded,
-    nr: c.FirstReplyNr,
-    parentNr: c.BodyNr,
-    authorId: c.SystemUserId,
-    approvedSource: "I give you goldy golden gold coins, glittery glittering!",
-  };
+  const guestsByEmailNameUrl: { [ipEmailNameUrl: string]: GuestToAdd } = {};
+  const postsByWpNr: { [wpPostId: number]: NewTestPost } = {};
 
-  builder.addPost(postToAdd);
-}
+  // Create posts and guests.
+  _.each(wpBlogPostAndComments.comments, (wpComment: WpComment) => {
+    const guest: GuestToAdd = {
+      fullName: wpComment.wp_comment_author,
+      email: wpComment.wp_comment_author_email,
+      postedFromIp: wpComment.wp_comment_author_ip,
+      createdTheLatestAtUtcStr: wpComment.wp_comment_date_gmt,
+      url: wpComment.wp_comment_author_url,
+    };
 
+    // Same email, name and URL means it's most likely the same person.
+    // (Remember that email addresses are fairly private: different commenters don't know each
+    // others' emails. If someone really did know someone else's email, and impersonated him/her
+    // and wrote weird things, pretending to be hen — then maybe the way to deal with that, is that
+    // the blog owner just deletes those weird comments, after imported to Talkyard. Or maybe
+    // creates a new user named Weird Guest and assigns ownership of the weird comments
+    // to that user.  [change-author])
+    const emailNameUrl = `${guest.email || ''}|${guest.fullName || ''}|${guest.url || ''}`;
 
-interface SaxTag {
-  name: string;
-  isSelfClosing: boolean;
-  attributes: { [key: string]: string };
+    guestsByEmailNameUrl[emailNameUrl] = guest;
+
+    // There are different WordPress comment types.
+    //
+    // Normal comments, example:  (comment_approved: 0 means not approved, 1 means yes approved)
+    //
+    // <wp:comment>
+    // <wp:comment_id>344634</wp:comment_id>
+    // <wp:comment_author><![CDATA[Author Name]]></wp:comment_author>
+    // <wp:comment_author_email><![CDATA[author-email@example.com]]></wp:comment_author_email>
+    // <wp:comment_author_url></wp:comment_author_url>
+    // <wp:comment_author_IP><![CDATA[111.111.111.111]]></wp:comment_author_IP>
+    // <wp:comment_date><![CDATA[2001-12-31 23:59:59]]></wp:comment_date>
+    // <wp:comment_date_gmt><![CDATA[2001-12-31 23:59:59]]></wp:comment_date_gmt>
+    // <wp:comment_content><![CDATA[Hi there. So very hello! Greetings. Bye.]]></wp:comment_content>
+    // <wp:comment_approved><![CDATA[0]]></wp:comment_approved>
+    // <wp:comment_type><![CDATA[]]></wp:comment_type>
+    // <wp:comment_parent>0</wp:comment_parent>
+    // <wp:comment_user_id>0</wp:comment_user_id>
+    // </wp:comment>
+    //
+    // And pingbacks and trackbacks. They have a remote blog post title, as author name.
+    // And the author url, is the url to that remote blog post. There's no email address.
+    //
+    // Pingback example:
+    //
+    // <wp:comment>
+    // <wp:comment_id>4709</wp:comment_id>
+    // <wp:comment_author><![CDATA[Pingback Blog Post Title]]></wp:comment_author>
+    // <wp:comment_author_email><![CDATA[]]></wp:comment_author_email>
+    // <wp:comment_author_url>http://www.example.com/blog-post-title.html</wp:comment_author_url>
+    // <wp:comment_author_IP><![CDATA[111.111.111.111]]></wp:comment_author_IP>
+    // <wp:comment_date><![CDATA[2001-12-31 23:59:59]]></wp:comment_date>
+    // <wp:comment_date_gmt><![CDATA[2001-12-31 23:59:59]]></wp:comment_date_gmt>
+    // <wp:comment_content><![CDATA[[...] Blah blah, is so very blah blah yes yes this
+    //    can be a whole paragraph long [...]]]></wp:comment_content>
+    // <wp:comment_approved><![CDATA[1]]></wp:comment_approved>
+    // <wp:comment_type><![CDATA[pingback]]></wp:comment_type>
+    // <wp:comment_parent>0</wp:comment_parent>
+    // <wp:comment_user_id>0</wp:comment_user_id>
+    // </wp:comment>
+    //
+    // Trackback example:
+    //
+    // <wp:comment>
+    // <wp:comment_id>36708</wp:comment_id>
+    // <wp:comment_author><![CDATA[Some blog post title]]></wp:comment_author>
+    // <wp:comment_author_email><![CDATA[]]></wp:comment_author_email>
+    // <wp:comment_author_url>http://blog2.example.com/topic-title</wp:comment_author_url>
+    // <wp:comment_author_IP><![CDATA[222.222.222.222]]></wp:comment_author_IP>
+    // <wp:comment_date><![CDATA[2001-01-31 23:59:59]]></wp:comment_date>
+    // <wp:comment_date_gmt><![CDATA[2001-01-31 23:59:59]]></wp:comment_date_gmt>
+    // <wp:comment_content><![CDATA[<strong>Something something</strong>
+    //
+    // Then usually a blank line (see above), then just a little bit more text]]></wp:comment_content>
+    // <wp:comment_approved><![CDATA[1]]></wp:comment_approved>
+    // <wp:comment_type><![CDATA[trackback]]></wp:comment_type>
+    // <wp:comment_parent>0</wp:comment_parent>
+    // <wp:comment_user_id>0</wp:comment_user_id>
+    // </wp:comment>
+
+    // To do, for pingback and trackbacks:
+    //  - Set name to the hostname of the blog, not the blog post title.
+    //  - Add a post title field to Talkyard's database, for the blog post title.
+    //  - Add post types:  Pingback and Trackback, and Webmention too.
+    //  - Add remote url field = the url to the pingback/trackback remote blog post.
+
+    const postToAdd: NewTestPost = {
+      page: pageJustAdded,
+      nr: nextReplyNr,
+      parentNr: wpComment.wp_comment_parent,
+      authorId: c.SystemUserId,
+      approvedSource: wpComment.wp_comment_content,
+      postedFromIp: wpComment.wp_comment_author_ip,
+      postedAtUtcStr: wpComment.wp_comment_date_gmt,
+      isApproved: wpComment.wp_comment_approved === 1,
+    };
+
+    nextReplyNr += 1;
+    postsByWpNr[wpComment.wp_comment_id] = postToAdd;
+  });
+
+  // Update parent nr.
+  _.each(wpBlogPostAndComments.comments, (wpComment: WpComment) => {
+    const thisPost = postsByWpNr[wpComment.wp_comment_id];
+    const anyParent = postsByWpNr[wpComment.wp_comment_parent];
+    if (anyParent) {
+      // Connect them, using Talkyard's post nrs.
+      thisPost.parentNr = anyParent.nr;
+    }
+    else {
+      // Then, top level comment.
+      thisPost.parentNr = c.BodyNr;
+    }
+  });
+
+  _.each(guestsByEmailNameUrl, builder.addGuest);
+  _.each(postsByWpNr, builder.addPost);
 }
 
 
 parser.onopentag = function (tag: SaxTag) {
   curWpTagName = tag.name;
+  //let numInterestingAttrsDbg = 0;
+  //let interestingAttrsDbgStr = '';
+  let addNewline = false;
 
   if (tag.name === 'item') {
     if (curWpBlogPost) {} // log error: nested posts
     else if (curWpComment) {} // log error: post in comment
     else curWpBlogPost = { comments: [] };
-    return;
+    addNewline = true;
   }
-
-  if (tag.name === 'wp:comment') {
+  else if (tag.name === 'wp:comment') {
     if (!curWpBlogPost) {} // log error: comment outside post
     else if (curWpComment) {} // log error: comment inside comment
     else curWpComment = {};
+  }
+  else {
     return;
+  }
+
+  // For debugging.
+  if (verbose) {
+    const attrStr =   //numInterestingAttrsDbg ? ' ' + numInterestingAttrsDbg :
+        _.isEmpty(tag.attributes) ? '' : ' …';
+    const newline = addNewline ? '\n' : '';
+    process.stdout.write(`${newline}<${tag.name + attrStr}>`);
   }
 };
 
@@ -145,92 +236,197 @@ parser.onclosetag = function (tagName: string) {
     wpPosts.push(curWpBlogPost);
     addBlogPostAndComments(curWpBlogPost);
     curWpBlogPost = undefined;
-    return;
   }
-  if (tagName === 'wp:comment' && curWpBlogPost && curWpComment) {
+  else if (tagName === 'wp:comment' && curWpBlogPost && curWpComment) {
     curWpBlogPost.comments.push(curWpComment);
     curWpComment = undefined;
+  }
+  else {
     return;
   }
+  if (verbose) process.stdout.write(`</${tagName}>`);
 };
 
 
-parser.ontext = function (text: string) {
-};
+parser.oncdata = handleText;
+parser.ontext = handleText;
 
 
-parser.oncdata = function (cdataString: string) {
+function handleText(textOrCdata: string) {
   // Blog post fields.
   if (!curWpComment && curWpBlogPost) switch (curWpTagName) {
-    case 'title': break;
-    case 'link': break;
-    case 'pubDate': break;
-    case 'dc:creator': break;
-    case 'guid': break;
-    case 'description': break;
-    case 'content:encoded': break;
-    case 'excerpt:encoded': break;
-    case 'wp:post_id': break;
-    case 'wp:post_date': break;
-    case 'wp:post_date_gmt': break;
-    case 'wp:comment_status': break;
-    case 'wp:ping_status': break;
-    case 'wp:post_name': break;
-    case 'wp:status': break;
-    case 'wp:post_parent': break;
-    case 'wp:menu_order': break;
-    case 'wp:post_type': break;
-    case 'wp:post_password': break;
-    case 'wp:is_sticky': break;
-    case 'category': break;
+    case 'title':
+      curWpBlogPost.title =
+          curWpBlogPost.title || textOrCdata;
+      break;
+    case 'link':
+      curWpBlogPost.link =
+          curWpBlogPost.link || textOrCdata;
+      break;
+    case 'pubDate':
+      curWpBlogPost.pubDate =
+          curWpBlogPost.pubDate || textOrCdata;
+      break;
+    case 'dc:creator':
+      //curWpBlogPost. ?? = textOrCdata;
+      break;
+    case 'guid':
+      curWpBlogPost.guid =
+          curWpBlogPost.guid || textOrCdata;
+      break;
+    case 'description':
+      curWpBlogPost.description =
+          curWpBlogPost.description || textOrCdata;
+      break;
+    case 'content:encoded':
+      curWpBlogPost.contentEncoded =
+          curWpBlogPost.contentEncoded || textOrCdata;
+      break;
+    case 'excerpt:encoded':
+      curWpBlogPost.excerptEncoded =
+          curWpBlogPost.excerptEncoded || textOrCdata;
+      break;
+    case 'wp:post_id':
+      curWpBlogPost.wp_post_id =
+          curWpBlogPost.wp_post_id || parseInt(textOrCdata);
+      break;
+    case 'wp:post_date':
+      curWpBlogPost.wp_post_date =
+          curWpBlogPost.wp_post_date || textOrCdata;
+      break;
+    case 'wp:post_date_gmt':
+      curWpBlogPost.wp_post_date_gmt =
+          curWpBlogPost.wp_post_date_gmt || textOrCdata;
+      break;
+    case 'wp:comment_status':
+      curWpBlogPost.wp_comment_status =
+          curWpBlogPost.wp_comment_status || textOrCdata;
+      break;
+    case 'wp:ping_status':
+      curWpBlogPost.wp_ping_status =
+          curWpBlogPost.wp_ping_status || textOrCdata;
+      break;
+    case 'wp:post_name':
+      curWpBlogPost.wp_post_name =
+          curWpBlogPost.wp_post_name || textOrCdata;
+      break;
+    case 'wp:status':
+      curWpBlogPost.wp_status =
+          curWpBlogPost.wp_status || textOrCdata;
+      break;
+    case 'wp:post_parent':
+      curWpBlogPost.wp_post_parent =
+          curWpBlogPost.wp_post_parent || parseInt(textOrCdata);
+      break;
+    case 'wp:menu_order':
+      curWpBlogPost.wp_menu_order =
+          curWpBlogPost.wp_menu_order || parseInt(textOrCdata);
+      break;
+    case 'wp:post_type':
+      curWpBlogPost.wp_post_type =
+          curWpBlogPost.wp_post_type || textOrCdata;
+      break;
+    case 'wp:post_password':
+      // Exclude.
+      break;
+    case 'wp:is_sticky':
+      // 0 or 1
+      curWpBlogPost.wp_is_sticky =
+          curWpBlogPost.wp_is_sticky || parseInt(textOrCdata);
+      break;
+    case 'category':
+      curWpBlogPost.category =
+          curWpBlogPost.category || textOrCdata;
+      break;
     default:
       // Ignore.
   }
 
   // Comment fields.
   if (curWpComment) switch (curWpTagName) {
-    case 'wp:comment_id': break;
-    case 'wp:comment_author': break;
-    case 'wp:comment_author_email': break;
-    case 'wp:comment_author_url': break;
-    case 'wp:comment_author_IP': break;
-    case 'wp:comment_date': break;
-    case 'wp:comment_date_gmt': break;
-    case 'wp:comment_content': break;
-    case 'wp:comment_approved': break;
-    case 'wp:comment_type': break;
-    case 'wp:comment_parent': break;
-    case 'wp:comment_user_id': break;
+    case 'wp:comment_id':
+      curWpComment.wp_comment_id =
+          curWpComment.wp_comment_id || parseInt(textOrCdata);
+      break;
+    case 'wp:comment_author':
+      curWpComment.wp_comment_author =
+          curWpComment.wp_comment_author || textOrCdata;
+      break;
+    case 'wp:comment_author_email':
+      curWpComment.wp_comment_author_email =
+          curWpComment.wp_comment_author_email || textOrCdata;
+      break;
+    case 'wp:comment_author_url':
+      curWpComment.wp_comment_author_url =
+          curWpComment.wp_comment_author_url || textOrCdata;
+      break;
+    case 'wp:comment_author_IP':
+      curWpComment.wp_comment_author_ip =
+          curWpComment.wp_comment_author_ip || textOrCdata;
+      break;
+    case 'wp:comment_date':
+      curWpComment.wp_comment_date =
+          curWpComment.wp_comment_date || textOrCdata;
+      break;
+    case 'wp:comment_date_gmt':
+      curWpComment.wp_comment_date_gmt =
+          curWpComment.wp_comment_date_gmt || textOrCdata;
+      break;
+    case 'wp:comment_content':
+      curWpComment.wp_comment_content =
+          curWpComment.wp_comment_content || textOrCdata;
+      break;
+    case 'wp:comment_approved':
+      // 0 or 1
+      curWpComment.wp_comment_approved =
+          curWpComment.wp_comment_approved || parseInt(textOrCdata);
+      break;
+    case 'wp:comment_type':
+      curWpComment.wp_comment_type =
+          curWpComment.wp_comment_type || textOrCdata;
+      break;
+    case 'wp:comment_parent':
+      curWpComment.wp_comment_parent =
+          curWpComment.wp_comment_parent || parseInt(textOrCdata);
+      break;
+    case 'wp:comment_user_id':
+      curWpComment.wp_comment_user_id =
+          curWpComment.wp_comment_user_id || parseInt(textOrCdata);
+      break;
     default:
       // Ignore.
   }
-};
+}
 
 
 parser.onattribute = function (attr: { name: string, value: string }) {
 };
 
 
+let errors = false;
+
 parser.onerror = function (error: any) {
+  errors = true;
+  console.error(`Error: ${error} [ToTyEPARSER]`);
 };
 
 
 parser.onend = function () {
-  const site = builder.getSite();
-  console.log(JSON.stringify(site, undefined, 2));
 };
 
 
-const args: any = minimist(process.argv.slice(2));
-
-const maybeFilePath: string | undefined = args.wordpressCoreXmlExportFile;
-
-if (!_.isString(maybeFilePath))
-  throw Error("Missing: --wordpressCoreXmlExportFile=...");
-
-const fileText = fs.readFileSync(args.wordpressCoreXmlExportFile, { encoding: 'utf8' });
-
-console.log('fileText: ' + fileText.substring(0, 99));
-
 parser.write(fileText).close();
+
+
+if (errors) {
+  console.log("There were errors. Aborting. Bye. [ToTyEGDBYE]");
+}
+else {
+  const site = builder.getSite();
+  const jsonString = JSON.stringify(site, undefined, 2);
+  process.stdout.write(
+      `\n\nDone processing. Writing ${jsonString.length} JSON chars to: ${writeToPath} ...`);
+  fs.writeFileSync(writeToPath, jsonString, { encoding: 'utf8' });
+  process.stdout.write(" Done.\n");
+}
 
