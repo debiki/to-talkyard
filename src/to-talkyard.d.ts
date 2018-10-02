@@ -43,6 +43,7 @@ interface NewTestPost {   // RENAME to PostToAdd
   authorId?: UserId; // if absent, will be the page author
   nr: number;
   parentNr?: number;
+  type?: number; // PostType
   approvedSource: string;
   approvedHtmlSanitized?: string;
   postedFromIp?: string;
